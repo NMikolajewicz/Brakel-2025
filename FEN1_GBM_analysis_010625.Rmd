@@ -224,7 +224,7 @@ for (i in 1:length(so.hs)) {
   tryCatch({
     seurat_object <- so.hs[[sample_name]]
     
-    # Calculate Conditional Dependency Index with FEN1 as reference
+    # Calculate Co-Dependency Index with FEN1 as reference
     cdi_result <- findCDIMarkers(seurat_object, features.x = "FEN1")
     cdi_result$sample <- sample_name
     
