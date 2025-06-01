@@ -3,7 +3,7 @@
 # README
 
 ## Citation
-Brakel B., ..., Singh S. (2025) *in prepararation.* 
+Brakel B., ..., Singh S. (2025) *in preparation.* 
 
 ## Scripts
 
