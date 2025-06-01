@@ -1,0 +1,739 @@
+---
+title: "FEN1 Expression Analysis in GBM Subtypes"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+editor_options: 
+  chunk_output_type: inline
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(
+    input = inputFile,
+    encoding = encoding,
+    output_file = if (exists("user")) {
+      paste0(xfun::sans_ext(inputFile), '_', user, "_", format(Sys.Date(), "%d%m%y"), '.html')
+    } else {
+      paste0(xfun::sans_ext(inputFile), '_', "Guest", "_", format(Sys.Date(), "%d%m%y"), '.html')
+    },
+    output_dir = if (exists("data.path")) paste0(data.path, "/HTML_Reports") else NULL
+  )
+})
+---
+
+```{r setup, include=FALSE}
+# =============================================================================
+# FEN1 Expression Analysis in Glioblastoma Multiforme (GBM) Single-Cell Data
+# =============================================================================
+# 
+# This analysis pipeline examines FEN1 gene expression patterns across:
+# 1. Co-dependency relationships with other genes
+# 2. Correlation with cancer hallmark pathways
+# 
+# Author: Nicholas Mikolajewicz
+# Email: n.mikolajewicz@utoronto.ca
+# Date: June 1, 2025
+# =============================================================================
+
+# Clear environment and setup
+rm(list = setdiff(ls(), c("data.path", "user")))
+invisible(gc())
+
+# Start timer for performance monitoring
+start.time <- proc.time()
+
+# Load required packages
+packages_to_load <- c(
+  # Core single-cell analysis
+  "scMiko", "Seurat", 
+  # Data manipulation
+  "plyr", "dplyr", "tidyr", "reshape2",
+  # Visualization and reporting
+  "DT", "flexdashboard", "ggpmisc", "ggplot2", "RColorBrewer", "cowplot",
+  # Parallel processing
+  "future", "foreach", "doParallel",
+  # Gene annotation and pathway analysis
+  "AnnotationDbi", "org.Mm.eg.db", "org.Hs.eg.db", "fgsea", "reactome.db",
+  # Additional visualization
+  "schex"
+)
+
+# Load packages with error handling
+invisible(lapply(packages_to_load, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    message(paste("Package", pkg, "not available"))
+  }
+}))
+```
+
+```{r load_gene_sets}
+# =============================================================================
+# GENE SET PREPARATION
+# =============================================================================
+# Load and prepare gene sets from multiple cancer databases for pathway analysis
+
+# Load master gene sets data
+data(geneSets)
+
+# 1. CancerSEA gene sets - cancer single-cell states
+cancer_df <- geneSets[["CancerSEA_Hs"]]
+cancer_list <- wideDF2namedList(cancer_df)
+names(cancer_list) <- paste0(names(cancer_list), "_CancerSEA")
+
+# 2. Verhaak classification - classical GBM subtypes
+verhaak_df <- geneSets[["Verhaak_CancerCell_2010"]]
+verhaak_list <- wideDF2namedList(verhaak_df)
+names(verhaak_list) <- paste0(names(verhaak_list), "_Verhaak")
+
+# 3. Richards classification - single-cell GBM subtypes
+richards_df <- geneSets[["Richards_NatureCancer_2021_sc"]]
+richards_list <- wideDF2namedList(richards_df)
+names(richards_list) <- paste0(names(richards_list), "_Richards")
+
+# 4. Neftel GBM states - four-state model (AC, OPC, MES, NPC)
+neftel_df <- geneSets[["GBM_Hs_Neftel2019"]]
+neftel_list <- wideDF2namedList(neftel_df)
+# Remove G-states (keeping only the main four states)
+neftel_list <- neftel_list[!grepl("G", names(neftel_list))]
+names(neftel_list) <- paste0(names(neftel_list), "_Neftel")
+
+# 5. Glioma Stem Cell catalog
+gsc_df <- geneSets[["GSC_Catalog"]]
+gsc_list <- wideDF2namedList(gsc_df)
+names(gsc_list) <- paste0(names(gsc_list), "_GSC")
+
+# 6. Gavish tumor hallmarks
+gavish_df <- geneSets[["Gavish2022_Tumor_Hallmarks"]]
+gavish_list <- wideDF2namedList(gavish_df)
+names(gavish_list) <- paste0(names(gavish_list), "_Gavish")
+
+# 7. MSigDB Hallmark pathways
+hallmark_df <- geneSets[["HALLMARK"]]
+hallmark_list <- wideDF2namedList(hallmark_df)
+names(hallmark_list) <- paste0(names(hallmark_list), "_HALLMARK")
+
+# 8. IVY GAP anatomical signatures
+ivy_df <- geneSets[["Puchalski2018_IVY_GBM"]]
+ivy_list <- wideDF2namedList(ivy_df)
+names(ivy_list) <- paste0(names(ivy_list), "_IVY")
+
+# 9. Load additional signature collections
+# Note: Update these file paths to your actual data location
+stemness_signatures <- tryCatch({
+  wideDF2namedList(readxl::read_xlsx(
+    "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/GBM/Reboot/Papers/Stemness_Signatures_280124.xlsx"
+  ))
+}, error = function(e) {
+  message("Stemness signatures file not found")
+  list()
+})
+
+greenwald_signatures <- tryCatch({
+  wideDF2namedList(readxl::read_xlsx(
+    "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/GBM/Reboot/Papers/Greenwald_metaprograms_280124.xlsx"
+  ))
+}, error = function(e) {
+  message("Greenwald signatures file not found")
+  list()
+})
+
+# 10. TMZ resistance signatures
+tmz_signatures <- tryCatch({
+  wideDF2namedList(readxl::read_xlsx(
+    "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Collaborations/Ben_Brakel/TMZ_signatures_151024.xlsx", 
+    "Carter"
+  ))
+}, error = function(e) {
+  message("TMZ signatures file not found")
+  list()
+})
+
+# Convert all gene symbols to uppercase for consistency
+miko_message("Converting gene symbols to uppercase...")
+gene_set_lists <- list(
+  verhaak_list, gsc_list, neftel_list, cancer_list, 
+  gavish_list, hallmark_list, ivy_list
+)
+
+gene_set_lists <- lapply(gene_set_lists, function(gene_set) {
+  lapply(gene_set, toupper)
+})
+
+# Combine all gene sets into master collection
+master_gene_sets <- c(
+  neftel_list, richards_list, cancer_list, verhaak_list, 
+  gavish_list, hallmark_list, ivy_list, gsc_list, 
+  stemness_signatures, greenwald_signatures, tmz_signatures
+)
+
+# Ensure all gene symbols are uppercase
+master_gene_sets <- lapply(master_gene_sets, toupper)
+
+miko_message(paste("Loaded", length(master_gene_sets), "gene sets for analysis"))
+```
+
+```{r load_seurat_objects}
+# =============================================================================
+# LOAD SINGLE-CELL RNA-SEQ DATA
+# =============================================================================
+# Load preprocessed Seurat objects containing GBM tumor scRNA-seq data
+
+# Load main Seurat object list (update path as needed)
+if (!exists("so.hs")) {
+  miko_message("Loading Seurat objects...")
+  so.hs <- readRDS("PR4_tumor_list_processed_miko_abdel_wang_080523.rds")
+}
+
+# Separate datasets by study/author
+so.hs.miko <- so.hs[grepl("Mikolajewicz", names(so.hs))]
+so.hs.wang <- so.hs[grepl("Wang", names(so.hs))]
+so.hs.abdel <- so.hs[grepl("Abdel", names(so.hs))]
+
+miko_message(paste("Loaded", length(so.hs), "total samples:"))
+miko_message(paste("- Mikolajewicz:", length(so.hs.miko), "samples"))
+miko_message(paste("- Wang:", length(so.hs.wang), "samples"))
+miko_message(paste("- Abdelfattah:", length(so.hs.abdel), "samples"))
+
+# Optional: Save individual study datasets
+# saveRDS(so.hs.miko, "tumor_inhouse_270224.rds")
+# saveRDS(so.hs.abdel, "tumor_abdel_270224.rds")
+# saveRDS(so.hs.wang, "tumor_wang_270224.rds")
+```
+
+```{r fen1_codependency_analysis, fig.width=3, fig.height=8}
+# =============================================================================
+# FEN1 CO-DEPENDENCY ANALYSIS
+# =============================================================================
+# Identify genes that have co-dependent expression patterns with FEN1 across all 
+# GBM samples using Co-Dependency Index (CDI)
+# 
+# CDI citation: Mikolajewicz, N., Gacesa, R., Aguilera-Uribe, M., Brown, K. R., 
+# Moffat, J., & Han, H. (2022). Multi-level cellular and functional annotation 
+# of single-cell transcriptomes using scPipeline. Communications Biology, 5(1), 1142.
+
+miko_message("Starting FEN1 co-dependency analysis...")
+
+# Initialize results storage
+cdi_results_list <- list()
+
+# Perform CDI analysis for each sample
+for (i in 1:length(so.hs)) {
+  sample_name <- names(so.hs)[i]
+  miko_message(paste("Processing sample:", sample_name))
+  
+  tryCatch({
+    seurat_object <- so.hs[[sample_name]]
+    
+    # Calculate Conditional Dependency Index with FEN1 as reference
+    cdi_result <- findCDIMarkers(seurat_object, features.x = "FEN1")
+    cdi_result$sample <- sample_name
+    
+    cdi_results_list[[sample_name]] <- cdi_result
+  }, error = function(e) {
+    message(paste("Error processing", sample_name, ":", e$message))
+  })
+}
+
+# Combine results across all samples
+cdi_combined <- bind_rows(cdi_results_list)
+
+# Summarize CDI results across samples
+cdi_summary <- cdi_combined %>%
+  dplyr::group_by(feature.y) %>%
+  dplyr::summarise(
+    ncdi_mean = mean(ncdi, na.rm = TRUE),
+    ncdi_median = median(ncdi, na.rm = TRUE),
+    ncdi_sd = sd(ncdi, na.rm = TRUE),
+    n_samples = length(ncdi),
+    n_significant = sum(fdr < 0.05, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Filter for genes tested in sufficient samples and perform statistical testing
+cdi_filtered <- cdi_summary %>% 
+  dplyr::filter(n_samples > 30)
+
+# Calculate z-scores and p-values for meta-analysis
+cdi_filtered$z_score <- cdi_filtered$ncdi_mean / (cdi_filtered$ncdi_sd / sqrt(cdi_filtered$n_samples))
+cdi_filtered$p_value <- z2p(cdi_filtered$z_score)
+cdi_filtered$fdr <- p.adjust(cdi_filtered$p_value, method = "BH")
+
+# Rank genes by mean CDI
+cdi_filtered$rank <- rank(cdi_filtered$ncdi_mean, ties.method = "random")
+
+# Identify significant FEN1 co-dependent genes
+significant_codep <- cdi_filtered %>% 
+  dplyr::filter(fdr < 0.05, n_significant/n_samples > 0.5)
+
+# Create visualization
+plot_cdi <- cdi_filtered %>%
+  ggplot(aes(x = rank, y = ncdi_mean)) + 
+  scattermore::geom_scattermore(color = "grey", alpha = 0.6) + 
+  geom_point(data = significant_codep, aes(x = rank, y = ncdi_mean), 
+             color = "red", size = 2) + 
+  ggrepel::geom_text_repel(
+    data = significant_codep, 
+    aes(x = rank, y = ncdi_mean, label = feature.y), 
+    color = "black", max.overlaps = Inf, size = 3,
+    box.padding = 0.5, point.padding = 0.2
+  ) + 
+  labs(
+    x = "Gene Rank", 
+    y = "Normalized Co-dependency Index (nCDI)", 
+    title = "FEN1 Co-dependent Genes in GBM",
+    subtitle = paste("Significant genes (FDR < 0.05):", nrow(significant_codep))
+  ) + 
+  theme_miko() +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5)
+
+print(plot_cdi)
+
+# Export results
+# write.csv(cdi_filtered, file = "FEN1_codependency_genes_analysis.csv", row.names = FALSE)
+# savePDF("FEN1_codependency_rank_plot.pdf", plot_cdi, fig.width=3, fig.height=8)
+
+miko_message(paste("Identified", nrow(significant_codep), "genes significantly co-dependent with FEN1"))
+```
+
+```{r pathway_correlation_analysis, fig.width=10, fig.height=10}
+# =============================================================================
+# PATHWAY CORRELATION ANALYSIS
+# =============================================================================
+# Evaluate correlations between FEN1 expression and cancer pathway activities
+# across GBM molecular subtypes
+
+# Define genes of interest (can be expanded)
+features_of_interest <- "FEN1"
+
+miko_message("Starting pathway correlation analysis...")
+
+# Initialize results storage
+correlation_results <- NULL
+module_score_results <- list()
+
+# Process each sample
+for (i in 1:length(so.hs)) {
+  sample_name <- names(so.hs)[i]
+  miko_message(paste("Processing sample:", sample_name))
+  
+  tryCatch({
+    seurat_object <- so.hs[[sample_name]]
+    
+    # Calculate module scores for all gene sets
+    module_scores <- runMS(
+      object = seurat_object, 
+      genelist = master_gene_sets, 
+      return.plots = FALSE, 
+      scale = FALSE
+    )
+    
+    # Extract module score data
+    module_data <- module_scores[["data"]] %>% 
+      dplyr::select(-c("class.ms"))
+    
+    # Add stemness scores
+    tryCatch({
+      module_data$CCAT <- scoreStem(seurat_object, method = "CCAT")
+    }, error = function(e) message("CCAT scoring failed"))
+    
+    tryCatch({
+      module_data$StemSC <- scoreStem(seurat_object, method = "StemSC")
+    }, error = function(e) message("StemSC scoring failed"))
+    
+    # Add gene expression data
+    available_features <- rownames(seurat_object@assays$SCT@data)[
+      rownames(seurat_object@assays$SCT@data) %in% features_of_interest
+    ]
+    
+    if (length(available_features) > 0) {
+      expression_matrix <- as.data.frame(
+        t(as.matrix(seurat_object@assays$SCT@data[available_features, ]))
+      )
+      module_data <- bind_cols(module_data, expression_matrix)
+    }
+    
+    # Calculate correlation matrix
+    correlation_matrix <- cor(module_data, method = "spearman", use = "complete.obs")
+    
+    # Extract correlations with features of interest
+    feature_correlations <- as.data.frame(
+      correlation_matrix[!(rownames(correlation_matrix) %in% features_of_interest),
+                        (rownames(correlation_matrix) %in% features_of_interest), drop = FALSE]
+    )
+    
+    # Store module scores for later analysis
+    module_score_results[[sample_name]] <- module_data
+    
+    # Format correlation results
+    feature_correlations$pathway <- rownames(feature_correlations)
+    feature_correlations$sample <- sample_name
+    correlation_results <- bind_rows(correlation_results, feature_correlations)
+    
+  }, error = function(e) {
+    message(paste("Error processing", sample_name, ":", e$message))
+  })
+}
+
+# Reshape correlation data for analysis
+correlation_long <- pivot_longer(
+  correlation_results, 
+  cols = features_of_interest,
+  names_to = "feature",
+  values_to = "correlation"
+)
+
+names(correlation_long) <- c("pathway", "sample", "feature", "correlation")
+
+miko_message("Pathway correlation analysis completed")
+```
+
+```{r subtype_classification}
+# =============================================================================
+# GBM SUBTYPE CLASSIFICATION
+# =============================================================================
+# Classify cells into Neftel GBM subtypes based on highest module scores
+
+miko_message("Classifying GBM subtypes...")
+
+# Add sample identifiers to module score data
+for (i in 1:length(module_score_results)) {
+  module_score_results[[names(module_score_results)[i]]]$study <- names(module_score_results)[i]
+}
+
+# Combine all expression data
+combined_expression <- bind_rows(module_score_results)
+
+# Focus on Neftel classification programs
+neftel_programs <- colnames(combined_expression)[grepl("Neftel", colnames(combined_expression))]
+neftel_scores <- combined_expression %>% 
+  dplyr::select(all_of(neftel_programs))
+
+# Combine MES and NPC sub-states
+neftel_scores$MES_Neftel <- (neftel_scores$MES2_Neftel + neftel_scores$MES1_Neftel) / 2
+neftel_scores$NPC_Neftel <- (neftel_scores$NPC1_Neftel + neftel_scores$NPC2_Neftel) / 2
+
+# Select final four subtypes
+final_neftel_scores <- neftel_scores %>% 
+  dplyr::select(c("AC_Neftel", "OPC_Neftel", "MES_Neftel", "NPC_Neftel"))
+
+# Assign subtype based on highest score
+max_score_indices <- apply(final_neftel_scores, 1, which.max)
+subtype_assignments <- colnames(final_neftel_scores)[max_score_indices]
+
+# Add subtype information to main dataset
+combined_expression$subtype <- subtype_assignments
+
+miko_message("Subtype classification completed")
+```
+
+```{r primary_recurrent_analysis}
+# =============================================================================
+# PRIMARY vs RECURRENT TUMOR ANALYSIS
+# =============================================================================
+# Compare FEN1 expression between primary and recurrent GBM tumors
+
+miko_message("Analyzing primary vs recurrent tumor differences...")
+
+# Prepare data for analysis
+expression_subset <- combined_expression %>% 
+  dplyr::select(all_of(c(features_of_interest, "study", "subtype")))
+
+# Extract study metadata
+expression_subset$study_name <- stringr::str_remove(expression_subset$study, "_[PR][0-9]*")
+expression_subset$tumor_type <- stringr::str_extract(
+  stringr::str_extract(expression_subset$study, "[PR][0-9]*"), "[PR]"
+)
+
+# Convert to long format
+expression_long <- pivot_longer(
+  expression_subset, 
+  cols = all_of(features_of_interest),
+  names_to = "feature",
+  values_to = "expression"
+)
+
+names(expression_long) <- c("cell_id", "subtype", "study", "tumor_type", "feature", "expression")
+
+# Summarize by sample (primary/recurrent comparison)
+sample_summary_pr <- expression_long %>% 
+  dplyr::group_by(cell_id, study, tumor_type, feature) %>%
+  dplyr::summarise(
+    expr_mean = mean(log10(expression + 1), na.rm = TRUE),
+    expr_median = median(expression, na.rm = TRUE),
+    expr_fraction = mean(expression > 0, na.rm = TRUE),
+    expr_gini = ineq::ineq(expression),
+    .groups = 'drop'
+  )
+
+# Summarize by subtype
+sample_summary_subtype <- expression_long %>% 
+  dplyr::group_by(cell_id, study, subtype, feature) %>%
+  dplyr::summarise(
+    expr_median = median(expression, na.rm = TRUE),
+    expr_fraction = mean(expression > 0, na.rm = TRUE),
+    expr_gini = ineq::ineq(expression),
+    .groups = 'drop'
+  )
+
+# Clean subtype names
+sample_summary_subtype$subtype <- gsub("_Neftel", "", sample_summary_subtype$subtype)
+
+# Initialize plot storage
+plots_pr <- list()
+plots_subtype <- list()
+
+# Results storage
+pr_summary_all <- NULL
+subtype_summary_all <- NULL
+
+# Analyze each feature
+for (i in 1:length(features_of_interest)) {
+  current_feature <- features_of_interest[i]
+  miko_message(paste("Analyzing feature:", current_feature))
+  
+  # PRIMARY/RECURRENT ANALYSIS
+  current_pr_data <- sample_summary_pr %>%
+    dplyr::filter(feature == current_feature) %>%
+    dplyr::group_by(study) %>%
+    dplyr::mutate(
+      expr_standardized = (expr_mean - mean(expr_mean, na.rm = TRUE)) / sd(expr_mean, na.rm = TRUE)
+    ) %>%
+    dplyr::filter(!is.na(expr_standardized))
+  
+  # Statistical tests by study
+  p_values <- list()
+  for (study in c("Abdelfattah", "Mikolajewicz", "Wang")) {
+    tryCatch({
+      study_data <- current_pr_data %>% dplyr::filter(study == study)
+      if (nrow(study_data) > 5) {
+        p_values[[study]] <- wilcox.test(expr_standardized ~ tumor_type, data = study_data)$p.value
+      }
+    }, error = function(e) {
+      p_values[[study]] <- NA
+    })
+  }
+  
+  # Pooled analysis
+  tryCatch({
+    p_values[["pooled"]] <- wilcox.test(expr_standardized ~ tumor_type, data = current_pr_data)$p.value
+  }, error = function(e) {
+    p_values[["pooled"]] <- NA
+  })
+  
+  # Summarize results
+  pr_current_summary <- current_pr_data %>% 
+    dplyr::group_by(tumor_type) %>% 
+    dplyr::summarize(
+      expr_mean = mean(expr_standardized, na.rm = TRUE),
+      expr_median = median(expr_standardized, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  pr_current_summary$feature <- current_feature
+  pr_current_summary$p_value <- p_values[["pooled"]]
+  pr_summary_all <- bind_rows(pr_summary_all, pr_current_summary)
+  
+  # Create plot
+  p_text <- paste(
+    "p_abdel =", signif(p_values[["Abdelfattah"]], 3),
+    ", p_miko =", signif(p_values[["Mikolajewicz"]], 3),
+    ", p_wang =", signif(p_values[["Wang"]], 3),
+    ", p_pooled =", signif(p_values[["pooled"]], 3)
+  )
+  
+  plots_pr[[current_feature]] <- current_pr_data %>%
+    ggplot(aes(x = tumor_type, y = expr_standardized)) + 
+    geom_boxplot(outlier.color = NA, fill = "grey90") + 
+    ggbeeswarm::geom_beeswarm(color = "black", pch = 21, fill = "grey", size = 1) +
+    facet_wrap(~study) + 
+    geom_hline(yintercept = 0, linetype = "dashed") + 
+    theme_miko() + 
+    labs(
+      x = "Tumor Type", 
+      y = "Standardized Expression", 
+      title = paste(current_feature, "Expression: Primary vs Recurrent"),
+      subtitle = p_text
+    )
+  
+  print(plots_pr[[current_feature]])
+  
+  # SUBTYPE ANALYSIS
+  current_subtype_data <- sample_summary_subtype %>%
+    dplyr::filter(feature == current_feature) %>%
+    dplyr::group_by(study) %>%
+    dplyr::mutate(
+      expr_standardized = (expr_fraction - mean(expr_fraction, na.rm = TRUE)) / sd(expr_fraction, na.rm = TRUE)
+    ) %>%
+    dplyr::filter(!is.na(expr_standardized))
+  
+  # Statistical tests for subtypes
+  subtype_p_values <- list()
+  for (study in c("Abdelfattah", "Mikolajewicz", "Wang")) {
+    tryCatch({
+      study_data <- current_subtype_data %>% dplyr::filter(study == study)
+      if (nrow(study_data) > 5) {
+        subtype_p_values[[study]] <- kruskal.test(expr_standardized ~ subtype, data = study_data)$p.value
+      }
+    }, error = function(e) {
+      subtype_p_values[[study]] <- NA
+    })
+  }
+  
+  # Pooled subtype analysis
+  tryCatch({
+    subtype_p_values[["pooled"]] <- kruskal.test(expr_standardized ~ subtype, data = current_subtype_data)$p.value
+  }, error = function(e) {
+    subtype_p_values[["pooled"]] <- NA
+  })
+  
+  # Summarize subtype results
+  subtype_current_summary <- current_subtype_data %>% 
+    dplyr::group_by(subtype) %>% 
+    dplyr::summarize(
+      expr_mean = mean(expr_standardized, na.rm = TRUE),
+      expr_median = median(expr_standardized, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  subtype_current_summary$feature <- current_feature
+  subtype_summary_all <- bind_rows(subtype_summary_all, subtype_current_summary)
+  
+  # Create subtype plot
+  subtype_p_text <- paste(
+    "p_abdel =", signif(subtype_p_values[["Abdelfattah"]], 3),
+    ", p_miko =", signif(subtype_p_values[["Mikolajewicz"]], 3),
+    ", p_wang =", signif(subtype_p_values[["Wang"]], 3),
+    ", p_pooled =", signif(subtype_p_values[["pooled"]], 3)
+  )
+  
+  plots_subtype[[current_feature]] <- current_subtype_data %>%
+    ggplot(aes(x = subtype, y = expr_standardized)) + 
+    geom_boxplot(outlier.color = NA, fill = "grey90") + 
+    ggbeeswarm::geom_beeswarm(color = "black", pch = 21, fill = "grey", size = 1) +
+    facet_wrap(~study) + 
+    geom_hline(yintercept = 0, linetype = "dashed") + 
+    theme_miko() + 
+    labs(
+      x = "GBM Subtype", 
+      y = "Standardized Expression", 
+      title = paste(current_feature, "Expression Across GBM Subtypes"),
+      subtitle = subtype_p_text
+    )
+  
+  print(plots_subtype[[current_feature]])
+}
+
+miko_message("Primary vs recurrent analysis completed")
+```
+
+```{r combined_plots, fig.width=20, fig.height=5}
+# =============================================================================
+# COMBINED VISUALIZATIONS
+# =============================================================================
+
+# Create combined plots for all features
+combined_plot_pr <- cowplot::plot_grid(plotlist = plots_pr, nrow = 2)
+combined_plot_subtype <- cowplot::plot_grid(plotlist = plots_subtype, nrow = 2)
+
+print(combined_plot_pr)
+print(combined_plot_subtype)
+
+# Save plots (uncomment to save)
+# savePDF("FEN1_primary_recurrent_expression.pdf", combined_plot_pr, fig.width=20, fig.height=5)
+# savePDF("FEN1_subtype_expression.pdf", combined_plot_subtype, fig.width=20, fig.height=5)
+```
+
+```{r pathway_correlation_visualization, fig.width=9, fig.height=7}
+# =============================================================================
+# PATHWAY CORRELATION VISUALIZATION
+# =============================================================================
+# Create volcano plot showing FEN1 correlations with cancer pathways
+
+miko_message("Creating pathway correlation visualization...")
+
+# Summarize correlations across samples
+pathway_correlation_summary <- correlation_long %>% 
+  dplyr::group_by(feature, pathway) %>%
+  dplyr::summarise(
+    correlation_mean = mean(correlation, na.rm = TRUE),
+    p_value = tryCatch({
+      wilcox.test(correlation[!is.na(correlation)])$p.value
+    }, error = function(e) NA),
+    .groups = 'drop'
+  )
+
+# Reshape for analysis
+pathway_wide <- pivot_wider(
+  pathway_correlation_summary,
+  names_from = "feature", 
+  values_from = c("correlation_mean", "p_value")
+)
+
+# Extract FEN1 results
+pathway_wide$FEN1_correlation <- pathway_wide$correlation_mean_FEN1
+pathway_wide$FEN1_p_adjusted <- p.adjust(pathway_wide$p_value_FEN1, method = "bonferroni")
+
+# Determine significance
+pathway_wide$significant <- pathway_wide$FEN1_p_adjusted < 0.05
+
+# Create volcano plot
+pathway_volcano_plot <- pathway_wide %>%
+  ggplot(aes(
+    x = FEN1_correlation, 
+    y = -log10(FEN1_p_adjusted), 
+    color = significant, 
+    size = -log10(FEN1_p_adjusted)
+  )) +
+  geom_point(alpha = 0.7) + 
+  ggrepel::geom_text_repel(
+    aes(label = pathway), 
+    size = 2.5, 
+    max.overlaps = 20,
+    box.padding = 0.5
+  ) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "grey50")) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue", alpha = 0.7) + 
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey", alpha = 0.7) + 
+  theme_miko() + 
+  theme(legend.position = "right") + 
+  labs(
+    x = "Correlation with FEN1 Expression",  
+    y = "-log10(Adjusted P-value)",
+    title = "FEN1 Correlations with Cancer Pathways",
+    subtitle = "Significant correlations highlighted in red",
+    color = "Significant",
+    size = "-log10(P-value)"
+  )
+
+print(pathway_volcano_plot)
+
+# Export significant results
+significant_pathways <- pathway_wide %>%
+  dplyr::filter(significant) %>%
+  dplyr::arrange(FEN1_p_adjusted) %>%
+  dplyr::select(pathway, FEN1_correlation, FEN1_p_adjusted)
+
+miko_message(paste("Found", nrow(significant_pathways), "significantly correlated pathways"))
+
+# Save results and plot (uncomment to save)
+# write.csv(pathway_wide, "FEN1_pathway_correlations.csv", row.names = FALSE)
+# savePDF("FEN1_pathway_correlations_volcano.pdf", pathway_volcano_plot, fig.width=9, fig.height=7)
+```
+
+```{r session_info}
+# =============================================================================
+# SESSION INFORMATION AND SUMMARY
+# =============================================================================
+
+# Calculate runtime
+end_time <- proc.time()
+runtime <- end_time - start.time
+
+miko_message("=== ANALYSIS COMPLETE ===")
+miko_message(paste("Total runtime:", round(runtime[3], 2), "seconds"))
+miko_message(paste("Samples analyzed:", length(so.hs)))
+miko_message(paste("Gene sets tested:", length(master_gene_sets)))
+miko_message(paste("Features analyzed:", paste(features_of_interest, collapse = ", ")))
+
+# Print session information
+cat("\n=== SESSION INFORMATION ===\n")
+sessionInfo()
+```
