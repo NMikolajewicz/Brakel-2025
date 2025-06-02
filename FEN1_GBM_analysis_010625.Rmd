@@ -345,10 +345,9 @@ for (i in 1:length(so.hs)) {
       rownames(seurat_object@assays$SCT@data) %in% features_of_interest
     ]
     
-    if (length(available_features) > 0) {
-      expression_matrix <- as.data.frame(
-        t(as.matrix(seurat_object@assays$SCT@data[available_features, ]))
-      )
+    if (length(available_features) == 1) {
+      expression_matrix <- as.data.frame((as.matrix(seurat_object@assays$SCT@data[available_features , ])))
+      colnames(expression_matrix) <- available_features
       module_data <- bind_cols(module_data, expression_matrix)
     }
     
