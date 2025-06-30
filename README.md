@@ -3,7 +3,7 @@
 # README
 
 ## Citation
-Brakel B., ..., Singh S. (2025) *in preparation.* 
+Brakel, B. A., McKenna, D., Puri, A., Shaikh, V. M., Singh, M., Saleh, A., Tomajian, A., Mikolajewicz, N., Beltrami, M., Anand, A., Miletric, P., Brown, K., Tieu, D., Maich, W., Salim, S., Suk, Y., Subapanditha, M., Gendoo, D., Venugopal, C., Moffat, J., Katyal, S., Chokshi, C., Singh, SK. (2025). Integrated genetic screening reveals FEN1 as a driver of stemness and temozolomide resistance in glioblastoma. *bioRxiv*, 2025-06. [Link](https://www.biorxiv.org/content/10.1101/2025.06.18.660339v1.full).
 
 ## Scripts
 
